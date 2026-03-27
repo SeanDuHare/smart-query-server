@@ -6,10 +6,11 @@ Endpoints:
   POST /v1/completions             - text completion
   POST /v1/chat/completions        - chat completion (supports streaming)
   POST /v1/sql                     - natural language → DuckDB SQL (cached)
-  POST /v1/embed                   - natural language query → embedding vector; pass hyde=true to expand via LLM first (HyDE)
+  POST /v1/embed                   - natural language query → embedding vector; pass hyde=false to avoid expanding via LLM first (HyDE)
   GET  /health                     - health check
 
-Set the model path with the --model flag or MODEL_PATH env var.
+Pass --model once per GGUF file to load multiple models simultaneously.
+MODEL_PATH env var sets a single default model.
 """
 
 import argparse
@@ -58,43 +59,37 @@ class Message(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "llama"
+    model: str = Field(default="", description="Model to use (basename of the GGUF file, e.g. 'llama-3.1-8B.gguf'). Leave blank to use the first loaded model.")
     messages: list[Message]
-    max_tokens: int = Field(default=512, ge=1, le=8192)
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.95, ge=0.0, le=1.0)
-    stream: bool = False
-    stop: Optional[list[str]] = None
+    max_tokens: int = Field(default=512, ge=1, le=8192, description="Maximum number of tokens to generate.")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature — higher is more creative, lower is more deterministic.")
+    top_p: float = Field(default=0.95, ge=0.0, le=1.0, description="Nucleus sampling cutoff — only tokens comprising the top P probability mass are considered.")
+    stream: bool = Field(default=False, description="Stream the response as server-sent events instead of returning it all at once.")
+    stop: Optional[list[str]] = Field(default=None, description="Stop generation when any of these strings are produced.")
 
 
 class CompletionRequest(BaseModel):
-    model: str = "llama"
-    prompt: str
-    max_tokens: int = Field(default=512, ge=1, le=8192)
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.95, ge=0.0, le=1.0)
-    stream: bool = False
-    stop: Optional[list[str]] = None
+    model: str = Field(default="", description="Model to use (basename of the GGUF file, e.g. 'llama-3.1-8B.gguf'). Leave blank to use the first loaded model.")
+    prompt: str = Field(description="The input text to continue.")
+    max_tokens: int = Field(default=512, ge=1, le=8192, description="Maximum number of tokens to generate.")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature — higher is more creative, lower is more deterministic.")
+    top_p: float = Field(default=0.95, ge=0.0, le=1.0, description="Nucleus sampling cutoff — only tokens comprising the top P probability mass are considered.")
+    stream: bool = Field(default=False, description="Stream the response as server-sent events instead of returning it all at once.")
+    stop: Optional[list[str]] = Field(default=None, description="Stop generation when any of these strings are produced.")
 
 
 class SqlRequest(BaseModel):
-    question: str
-    # Paste your DuckDB CREATE TABLE statements here so the model generates
-    # valid column/table names. Example:
-    #   schema: "CREATE TABLE files (id INT, name VARCHAR, path VARCHAR, size BIGINT, modified TIMESTAMP);"
-    schema: str = ""
-    max_tokens: int = Field(default=200, ge=1, le=512)
+    model: str = Field(default="", description="Model to use (basename of the GGUF file, e.g. 'llama-3.1-8B.gguf'). Leave blank to use the first loaded model.")
+    question: str = Field(description="Natural language question to convert into a DuckDB SQL query, e.g. 'find all TIFF files larger than 100 MB modified this week'.")
+    schema: str = Field(default="", description="DuckDB CREATE TABLE statement(s) for your data. Providing this lets the model use the correct table and column names. Example: 'CREATE TABLE files (id INT, name VARCHAR, path VARCHAR, size BIGINT, modified TIMESTAMP);'")
+    max_tokens: int = Field(default=200, ge=1, le=512, description="Maximum number of tokens to generate. SQL queries are short, so the default of 200 is usually plenty.")
 
 
 class SearchRequest(BaseModel):
-    # Natural language query to embed — the client runs VSS in DuckDB-wasm
-    query: str
-    # Return top_k nearest neighbors if the client also sends candidate vectors
-    # (optional — if omitted the server just returns the embedding vector)
-    top_k: int = Field(default=10, ge=1, le=100)
-    # HyDE: use the LLM to generate a hypothetical document before embedding.
-    # Improves recall by closing the gap between short queries and longer documents.
-    hyde: bool = True
+    query: str = Field(description="Natural language search query, e.g. 'fluorescence microscopy images of cell division'.")
+    model: str = Field(default="", description="Model to use for HyDE expansion (basename of the GGUF file). Leave blank to use the first loaded model. Ignored when hyde=false.")
+    top_k: int = Field(default=10, ge=1, le=100, description="Number of nearest neighbours the client should retrieve (informational — the server returns the vector and the client runs VSS locally in DuckDB-wasm).")
+    hyde: bool = Field(default=True, description="When true, the LLM first writes a short hypothetical document that would answer the query, then that document is embedded instead of the raw query. This significantly improves recall when queries are short and indexed documents are long. Disable for raw query embedding.")
 
 
 # ---------------------------------------------------------------------------
@@ -127,18 +122,30 @@ async def timing_middleware(request: Request, call_next):
     response.headers["X-Response-Time"] = f"{elapsed:.3f}s"
     return response
 
-llm: Optional[Llama] = None
-model_path: str = ""
+# Loaded models: maps model-id (file basename) → Llama instance
+_models: dict[str, Llama] = {}
+# Per-model inference lock — llama.cpp is single-threaded per instance,
+# but different models can run concurrently.
+_model_locks: dict[str, asyncio.Lock] = {}
 
-# Serializes inference calls so concurrent requests queue instead of
-# crashing — llama.cpp is single-threaded per model instance.
-_inference_lock = asyncio.Lock()
 
+def get_llm(name: str | None = None) -> tuple[str, Llama, asyncio.Lock]:
+    """Return (resolved_name, llm, lock) for the requested model.
 
-def get_llm() -> Llama:
-    if llm is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    return llm
+    Pass None or "" to use the first loaded model (default).
+    Raises 404 if a non-empty name is given that doesn't match any loaded model.
+    """
+    if not _models:
+        raise HTTPException(status_code=503, detail="No model loaded")
+    if not name:
+        key = next(iter(_models))
+        return key, _models[key], _model_locks[key]
+    if name not in _models:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{name}' not found. Loaded models: {list(_models)}",
+        )
+    return name, _models[name], _model_locks[name]
 
 
 # ---------------------------------------------------------------------------
@@ -194,35 +201,33 @@ def _stream_completion(response_iter: Iterator) -> Iterator[str]:
 def health():
     return {
         "status": "ok",
-        "model_loaded": llm is not None,
-        "queue_locked": _inference_lock.locked(),
+        "models": {
+            name: {"queue_locked": _model_locks[name].locked()}
+            for name in _models
+        },
     }
 
 
 @app.get("/v1/models")
 def list_models():
-    name = os.path.basename(model_path) if model_path else "llama"
+    now = int(time.time())
     return {
         "object": "list",
         "data": [
-            {
-                "id": name,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "local",
-            }
+            {"id": name, "object": "model", "created": now, "owned_by": "local"}
+            for name in _models
         ],
     }
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    model = get_llm()
+    _, model, inference_lock = get_llm(req.model or None)
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     log.info("chat/completions → %d messages, max_tokens=%d", len(messages), req.max_tokens)
 
     t0 = time.perf_counter()
-    async with _inference_lock:
+    async with inference_lock:
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: model.create_chat_completion(
@@ -248,11 +253,11 @@ async def chat_completions(req: ChatCompletionRequest):
 
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest):
-    model = get_llm()
+    _, model, inference_lock = get_llm(req.model or None)
 
     log.info("completions → prompt_len=%d chars, max_tokens=%d", len(req.prompt), req.max_tokens)
     t0 = time.perf_counter()
-    async with _inference_lock:
+    async with inference_lock:
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: model.create_completion(
@@ -293,8 +298,8 @@ async def text_to_sql(req: SqlRequest):
 
     Returns: { "sql": "SELECT ..." }
     """
-    model = get_llm()
-    cache_key = (req.schema, req.question.strip().lower())
+    resolved_name, model, inference_lock = get_llm(req.model or None)
+    cache_key = (resolved_name, req.schema, req.question.strip().lower())
 
     if cache_key in _sql_cache:
         log.info("sql cache hit for: %s", req.question[:60])
@@ -313,7 +318,7 @@ async def text_to_sql(req: SqlRequest):
 
     log.info("sql → question: %s", req.question[:80])
     t0 = time.perf_counter()
-    async with _inference_lock:
+    async with inference_lock:
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: model.create_chat_completion(
@@ -362,7 +367,7 @@ async def embed_query(req: SearchRequest):
     hyde_doc: Optional[str] = None
 
     if req.hyde:
-        model = get_llm()
+        _, model, inference_lock = get_llm(req.model or None)
         messages = [
             {
                 "role": "system",
@@ -375,7 +380,7 @@ async def embed_query(req: SearchRequest):
         ]
         log.info("hyde → generating hypothetical doc for: %s", req.query[:80])
         t_hyde = time.perf_counter()
-        async with _inference_lock:
+        async with inference_lock:
             hyde_response = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: model.create_chat_completion(
@@ -410,8 +415,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Llama LLM web server")
     parser.add_argument(
         "--model",
-        default=os.environ.get("MODEL_PATH", ""),
-        help="Path to the GGUF model file (or set MODEL_PATH env var)",
+        action="append",
+        dest="models",
+        metavar="PATH",
+        default=None,
+        help="Path to a GGUF model file (repeat to load multiple models)",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
@@ -438,30 +446,34 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
 
-    if not args.model:
+    env_path = os.environ.get("MODEL_PATH", "")
+    model_paths: list[str] = args.models or ([env_path] if env_path else [])
+    if not model_paths:
         raise SystemExit(
             "Error: no model specified. Use --model <path-to-model.gguf> "
-            "or set the MODEL_PATH environment variable."
+            "(repeat for multiple models) or set the MODEL_PATH env var."
         )
 
-    model_path = args.model
-    print(f"Loading model: {model_path}")
+    for path in model_paths:
+        name = os.path.basename(path)
+        print(f"Loading model: {path}")
+        _models[name] = Llama(
+            model_path=path,
+            n_ctx=args.n_ctx,
+            n_batch=args.n_batch,
+            n_gpu_layers=args.n_gpu_layers,
+            n_threads=args.threads,
+            # Keep KV cache in fp16 to halve its memory usage
+            f16_kv=True,
+            # Disable memory-mapping if the model fits in RAM — faster random access
+            use_mmap=True,
+            use_mlock=False,
+            verbose=False,
+        )
+        _model_locks[name] = asyncio.Lock()
+        print(f"  ✓ {name}")
 
-    llm = Llama(
-        model_path=model_path,
-        n_ctx=args.n_ctx,
-        n_batch=args.n_batch,
-        n_gpu_layers=args.n_gpu_layers,
-        n_threads=args.threads,
-        # Keep KV cache in fp16 to halve its memory usage
-        f16_kv=True,
-        # Disable memory-mapping if the model fits in RAM — faster random access
-        use_mmap=True,
-        use_mlock=False,
-        verbose=False,
-    )
-
-    print(f"Model loaded. Server running on http://{args.host}:{args.port}")
+    print(f"Server running on http://{args.host}:{args.port}")
 
     log_config = {
         "version": 1,
