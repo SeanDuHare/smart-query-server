@@ -1,4 +1,4 @@
-# Llama LLM Web Server
+# Smart Query Server
 
 A lightweight OpenAI-compatible REST API server for running Llama (GGUF) models locally.
 
@@ -10,7 +10,7 @@ A lightweight OpenAI-compatible REST API server for running Llama (GGUF) models 
 ## Setup
 
 ```bash
-cd test-llm-server
+cd smart-query-server
 
 # Create and activate a virtual environment
 python -m venv .venv
