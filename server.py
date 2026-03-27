@@ -6,7 +6,7 @@ Endpoints:
   POST /v1/completions             - text completion
   POST /v1/chat/completions        - chat completion (supports streaming)
   POST /v1/sql                     - natural language → DuckDB SQL (cached)
-  POST /v1/embed                   - natural language query → embedding vector (client runs VSS in DuckDB-wasm)
+  POST /v1/embed                   - natural language query → embedding vector; pass hyde=true to expand via LLM first (HyDE)
   GET  /health                     - health check
 
 Set the model path with the --model flag or MODEL_PATH env var.
@@ -92,6 +92,9 @@ class SearchRequest(BaseModel):
     # Return top_k nearest neighbors if the client also sends candidate vectors
     # (optional — if omitted the server just returns the embedding vector)
     top_k: int = Field(default=10, ge=1, le=100)
+    # HyDE: use the LLM to generate a hypothetical document before embedding.
+    # Improves recall by closing the gap between short queries and longer documents.
+    hyde: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -349,19 +352,54 @@ async def embed_query(req: SearchRequest):
         SELECT *, array_distance(embedding, ?::FLOAT[384]) AS _distance
         FROM files ORDER BY _distance LIMIT 10;
 
-    Returns: { "embedding": [0.123, ...], "dim": 384 }
+    With hyde=true the LLM first generates a short hypothetical document that
+    would answer the query; that document is embedded instead of the raw query.
+    This improves recall when queries are much shorter than indexed documents.
+
+    Returns: { "embedding": [0.123, ...], "dim": 384, "hyde_doc": "..." | null }
     """
+    text_to_embed = req.query
+    hyde_doc: Optional[str] = None
+
+    if req.hyde:
+        model = get_llm()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Write a short, factual document (2-4 sentences) that directly answers "
+                    "the user's query. Output only the document text, no commentary."
+                ),
+            },
+            {"role": "user", "content": req.query},
+        ]
+        log.info("hyde → generating hypothetical doc for: %s", req.query[:80])
+        t_hyde = time.perf_counter()
+        async with _inference_lock:
+            hyde_response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=120,
+                    temperature=0.3,
+                    top_p=0.95,
+                ),
+            )
+        hyde_doc = hyde_response["choices"][0]["message"]["content"].strip()
+        log.info("hyde → doc in %.2fs: %s", time.perf_counter() - t_hyde, hyde_doc[:80])
+        text_to_embed = hyde_doc
+
     async with _embed_lock:
         embed_model = await asyncio.get_event_loop().run_in_executor(
             None, get_embed_model
         )
         t0 = time.perf_counter()
         vec = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: embed_model.encode(req.query).tolist()
+            None, lambda: embed_model.encode(text_to_embed).tolist()
         )
     elapsed = time.perf_counter() - t0
     log.info("embed '%s' → dim=%d in %.3fs", req.query[:60], len(vec), elapsed)
-    return {"embedding": vec, "dim": len(vec)}
+    return {"embedding": vec, "dim": len(vec), "hyde_doc": hyde_doc}
 
 
 # ---------------------------------------------------------------------------
