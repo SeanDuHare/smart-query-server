@@ -94,8 +94,8 @@ huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
 ## Run the server
 
 ```bash
-# python server.py --model ./models/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf
-python server.py --model ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+# Loads in two models (which is optional, you just need one)
+python server.py --model ./models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --model ./models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 ```
 
 ### Options
