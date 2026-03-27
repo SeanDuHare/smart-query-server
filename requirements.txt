@@ -1,0 +1,11 @@
+# Core server
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+
+# Llama inference (CPU build)
+# For GPU (Metal/CUDA) see README for alternative install commands
+llama-cpp-python>=0.2.56
+
+# DuckDB VSS semantic search — embedding only (DuckDB runs in the browser via duckdb-wasm)
+sentence-transformers>=2.7.0
